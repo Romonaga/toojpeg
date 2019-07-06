@@ -4,8 +4,16 @@
 // see https://create.stephan-brumme.com/toojpeg/
 //
 
+//Forked and Modified By Robert Winslow.
+//I forked this fantasitc library, however i needed to make it a bit more C++ like
+//The only modification is the passing of a void pointer so I can pass the calling class in.
+//As i needed to be able to reaccess the calling class.  Fantastic bit of work that saved me hours
+//Of time.  Thank You sir for your hard work!
+
+
 #include "toojpeg.h"
 
+// notes:
 // - the "official" specifications: https://www.w3.org/Graphics/JPEG/itu-t81.pdf and https://www.w3.org/Graphics/JPEG/jfif3.pdf
 // - a short documentation of the JFIF/JPEG file format can be found in the Wikipedia: https://en.wikipedia.org/wiki/JPEG_File_Interchange_Format
 // - the popular STB Image library includes Jon's JPEG encoder as well: https://github.com/nothings/stb/blob/master/stb_image_write.h
@@ -21,12 +29,34 @@ namespace // anonymous namespace to hide local functions / constants / etc.
 // data types (for internal use only)
 
 // one byte
-using uint8_t  = unsigned char;
+typedef unsigned char   uint8_t;
 // two bytes
-using uint16_t = unsigned short;
-using  int16_t =          short;
+typedef unsigned short uint16_t;
+typedef          short  int16_t;
 // four bytes (or more)
-using  int32_t =          int;
+typedef          int    int32_t;
+
+// ////////////////////////////////////////
+// basic structs (for internal use only)
+
+// represent a few bits, typically a Huffman code
+struct BitCode
+{
+  BitCode() {}       // undefined state, must be initialized at a later time
+  BitCode(uint16_t code_, uint8_t numBits_)
+  : code(code_), numBits(numBits_) {}
+  uint16_t code;     // JPEG's Huffman codes are limited to 16 bits
+  uint8_t  numBits;  // actual number of bits
+};
+
+// store the most recently encoded bits that are not written yet
+struct BitBuffer
+{
+  BitBuffer()        // actually, there will be only one instance of this object
+  : bits(0), numBits(0) {}
+  int32_t bits;      // actually only at most 24 bits are used
+  uint8_t numBits;   // number of valid bits (the right-most bits)
+};
 
 // ////////////////////////////////////////
 // constants (for internal use only)
@@ -66,17 +96,20 @@ const uint8_t ZigZagInv[8*8] =
       58,59,52,45,38,31,39,46,   //            21,34,37,47,50,56,59,61,
       53,60,61,54,47,55,62,63 }; //            35,36,48,49,57,58,62,63
 
-// some DCT constants
-const auto SqrtHalfSqrt = 1.306562965f; // sqrt((2 + sqrt(2)) / 2) = cos(pi * 1 / 8) * sqrt(2)
-const auto HalfSqrtSqrt = 0.382683432f; // sqrt( 2 - sqrt(2)) / 2  = cos(pi * 3 / 8)
-const auto InvSqrt      = 0.707106781f; // 1 / sqrt(2)             = cos(pi * 2 / 8)
-const auto InvSqrtSqrt  = 0.541196100f; // 1 / sqrt(2 - sqrt(2))   = cos(pi * 3 / 8) * sqrt(2)
+// some constants for our DCT
+const auto SqrtHalfSqrt = 1.306562965f; // sqrt((2 + sqrt(2)) / 2)  = cos(pi * 1 / 8) * sqrt(2)
+const auto HalfSqrtSqrt = 0.382683432f; // sqrt( 2 - sqrt(2)) / 2   = cos(pi * 3 / 8)
+const auto InvSqrt      = 0.707106781f; // 1 / sqrt(2)              = cos(pi * 2 / 8)
+const auto InvSqrtSqrt  = 0.541196100f; // 1 / sqrt(2 - sqrt(2))    = cos(pi * 3 / 8) * sqrt(2)
+// scaling constants for AAN DCT algorithm: AanScaleFactors[0] = 1, AanScaleFactors[k=1..7] = cos(k*PI/16) * sqrt(2)
+const float AanScaleFactors[8] = { 1, 1.387039845f, SqrtHalfSqrt, 1.175875602f, 1, 0.785694958f, InvSqrtSqrt, 0.275899379f };
 
-// static Huffman code tables from JPEG standard Annex K
-// - CodesPerBitsize tables define how many Huffman codes will have a certain bitsize (plus 1 because there nothing with zero bits),
+// use Huffman code tables recommended by the JPEG standard Annex K
+// - they work quite well for most images but are not optimal
+// - CodesPerBitsize tables define how many Huffman codes will have a certain bitsize (plus 1),
 //   e.g. DcLuminanceCodesPerBitsize[2] = 5 because there are 5 Huffman codes being 2+1=3 bits long
 // - Values tables are a list of values ordered by their Huffman code bitsize,
-//   e.g. AcLuminanceValues => Huffman(0x01,0x02 and 0x03) will have 2 bits, Huffman(0x00) will have 3 bits, Huffman(0x04,0x11 and 0x05) will have 4 bits, ...
+//   e.g. AcLuminanceValues => Huffman(0x01,0x02,0x03) will have 2 bits, Huffman(0x00) will have 3 bits, Huffman(0x04,0x11,0x05) will have 4 bits, ...
 
 // Huffman definitions for first DC/AC tables (luminance / Y channel)
 const uint8_t DcLuminanceCodesPerBitsize[16]   = { 0,1,5,1,1,1,1,1,1,0,0,0,0,0,0,0 };   // sum = 12
@@ -102,27 +135,6 @@ const uint8_t AcChrominanceValues        [162] =                                
       0x88,0x89,0x8A,0x92,0x93,0x94,0x95,0x96,0x97,0x98,0x99,0x9A,0xA2,0xA3,0xA4,0xA5,0xA6,0xA7,0xA8,0xA9,0xAA,0xB2,0xB3,0xB4,
       0xB5,0xB6,0xB7,0xB8,0xB9,0xBA,0xC2,0xC3,0xC4,0xC5,0xC6,0xC7,0xC8,0xC9,0xCA,0xD2,0xD3,0xD4,0xD5,0xD6,0xD7,0xD8,0xD9,0xDA,
       0xE2,0xE3,0xE4,0xE5,0xE6,0xE7,0xE8,0xE9,0xEA,0xF2,0xF3,0xF4,0xF5,0xF6,0xF7,0xF8,0xF9,0xFA };
-const int16_t CodeWordLimit = 2048; // +/-2^11, maximum value after DCT
-
-// ////////////////////////////////////////
-// basic structs (for internal use only)
-
-// represent a few bits, typically a Huffman code
-struct BitCode
-{
-  BitCode() = default; // undefined state, must be initialized at a later time
-  BitCode(uint16_t code_, uint8_t numBits_)
-  : code(code_), numBits(numBits_) {}
-  uint16_t code;       // JPEG's Huffman codes are limited to 16 bits
-  uint8_t  numBits;    // number of valid bits
-};
-
-// store the most recently encoded bits that are not written yet
-struct BitBuffer
-{
-  int32_t data    = 0; // actually only at most 24 bits are used
-  uint8_t numBits = 0; // number of valid bits (the right-most bits)
-};
 
 // ////////////////////////////////////////
 // helper functions / templates
@@ -136,44 +148,47 @@ Number minimum(Number value, Number maximum)
 
 // restrict a value to the interval [minimum, maximum]
 template <typename Number, typename Limit>
-Number clamp(Number value, Limit minValue, Limit maxValue)
+Number clamp(Number value, Limit minimum, Limit maximum)
 {
-  if (value <= minValue) return minValue; // never smaller than the minimum
-  if (value >= maxValue) return maxValue; // never bigger  than the maximum
-  return value;                           // value was inside interval, keep it
+  if (value <= minimum) return minimum; // never smaller than the minimum
+  if (value >= maximum) return maximum; // never bigger  than the maximum
+  return value;                         // value was inside interval, keep it
 }
 
 // convert from RGB to YCbCr, constants are similar to ITU-R, see https://en.wikipedia.org/wiki/YCbCr#JPEG_conversion
-float rgb2y (float r, float g, float b) { return +0.299f   * r +0.587f   * g +0.114f   * b; }
-float rgb2cb(float r, float g, float b) { return -0.16874f * r -0.33126f * g +0.5f     * b; }
-float rgb2cr(float r, float g, float b) { return +0.5f     * r -0.41869f * g -0.08131f * b; }
+template <typename T>
+float rgb2y (T r, T g, T b) { return +0.299f   * r +0.587f    * g +0.114f  * b; }
+template <typename T>
+float rgb2cb(T r, T g, T b) { return -0.16874f * r -0.33126f * g +0.5f     * b; } // ITU: -0.168736f * r -0.331264f * g +0.5f      * b
+template <typename T>
+float rgb2cr(T r, T g, T b) { return +0.5f     * r -0.41869f * g -0.08131f * b; } // ITU: +0.5f      * r -0.418688f * g -0.081312f * b
 
 // start a new JFIF block
-void writeMarker(TooJpeg::WRITE_ONE_BYTE output, uint8_t id, uint16_t length)
+void writeMarker(void* caller, TooJpeg::WRITE_ONE_BYTE output, uint8_t id, uint16_t length)
 {
-  output(0xFF); output(id);      // ID, always preceded by 0xFF
-  output(uint8_t(length >> 8));  // length of the following data (big-endian)
-  output(uint8_t(length & 0xFF));
+  output(caller, 0xFF); output(caller, id);      // ID, always preceded by 0xFF
+  output(caller, uint8_t(length >> 8));  // length of the following data (big-endian)
+  output(caller, uint8_t(length & 0xFF));
 }
 
 // write bits stored in BitCode, keep excess bits in BitBuffer
-void writeBits(TooJpeg::WRITE_ONE_BYTE output, BitBuffer& buffer, BitCode data)
+void writeBits(void* caller, TooJpeg::WRITE_ONE_BYTE output, BitBuffer& buffer, BitCode data)
 {
   // append the new bits to those bits leftover from previous call(s)
   buffer.numBits += data.numBits;
-  buffer.data   <<= data.numBits;
-  buffer.data    |= data.code;
+  buffer.bits   <<= data.numBits;
+  buffer.bits    |= data.code;
 
   // write all "full" bytes
   while (buffer.numBits >= 8)
   {
     // extract highest 8 bits
     buffer.numBits -= 8;
-    auto oneByte = (buffer.data >> buffer.numBits) & 0xFF;
-    output(oneByte);
+    auto oneByte = (buffer.bits >> buffer.numBits) & 0xFF;
+    output(caller, oneByte);
 
     if (oneByte == 0xFF) // 0xFF has a special meaning for JPEGs (it's a block marker)
-      output(0);         // therefore pad a zero to indicate "nope, this one ain't a marker, it's just a coincidence"
+      output(caller, 0);         // therefore pad a zero to indicate "nope, this one ain't a marker, it's just a coincidence"
 
     // note: I don't clear those written bits, therefore buffer.bits contains garbage in the high bits
     //       if you really want to "clean up" (e.g. for debugging purposes) then uncomment the following line
@@ -181,8 +196,28 @@ void writeBits(TooJpeg::WRITE_ONE_BYTE output, BitBuffer& buffer, BitCode data)
   }
 }
 
+// convert to a JPEG codeword
+BitCode convertCode(int16_t value)
+{
+  // positive value: code = value,     numBits = position of highest set bit
+  // negative value: ignore sign, then numBits = position of highest set bit, and code = (2^numBits) - 1 + value
+  auto absolute = value >= 0 ? +value : -value; // by the way: value is never zero
+  auto mask = 0;       // will be 2^numBits - 1
+  // find position of highest set bit, fast way for GCC: result.numBits = 32 - __builtin_clz(value);
+  auto numBits = 0;
+  while (absolute > mask)
+  {
+    numBits++;
+    mask = 2*mask + 1; // append a set bit (numBits increased by one, so we need to update 2^numBits - 1)
+  }
+
+  // remember: mask = 2^numBits - 1, so if the original value was negative we can cheaply compute code = (2^numBits) - 1 + value = mask + value
+  return BitCode(value >= 0 ? value : value + mask, numBits);
+}
+
 // forward DCT computation "in one dimension" (fast AAN algorithm: Arai, Agui and Nakajima: "A fast DCT-SQ scheme for images")
-void DCT(float block[8*8], uint8_t stride) // stride must be 1 (=horizontal) or 8 (=vertical)
+template <int stride> // stride must be 1 (=horizontal) or 8 (=vertical)
+void DCT(float block[8*8])
 {
   // modify in-place
   auto& block0 = block[0 * stride];
@@ -223,34 +258,35 @@ void DCT(float block[8*8], uint8_t stride) // stride must be 1 (=horizontal) or 
 }
 
 // run DCT, quantize and write Huffman bit codes
-int16_t encodeBlock(TooJpeg::WRITE_ONE_BYTE output, BitBuffer& buffer,
+int16_t encodeBlock(void* caller, TooJpeg::WRITE_ONE_BYTE output, BitBuffer& buffer,
                     float block[8][8], const float scaled[8*8], int16_t lastDC,
-                    const BitCode huffmanDC[256], const BitCode huffmanAC[256], const BitCode* codewords)
+                    const BitCode huffmanDC[256], const BitCode huffmanAC[256])
 {
   // "linearize" the 8x8 block, treat it as a flat array of 64 floats
   auto block64 = (float*) block;
 
   // DCT: rows
   for (auto offset = 0; offset < 8; offset++)
-    DCT(block64 + offset*8, 1);
+    DCT<1>(block64 + offset*8);
   // DCT: columns
   for (auto offset = 0; offset < 8; offset++)
-    DCT(block64 + offset*1, 8);
+    DCT<8>(block64 + offset*1);
 
   // scale
   for (auto i = 0; i < 8*8; i++)
     block64[i] *= scaled[i];
 
   // encode DC (the first coefficient is the "average color" of the 8x8 block)
-  auto DC = int(block64[0] + (block64[0] >= 0 ? +0.5f : -0.5f)); // C++11's nearbyint() achieves a similar effect
+  // convert to an integer
+  auto DC = int16_t(block64[0] + (block64[0] >= 0 ? +0.5f : -0.5f)); // C++11's nearbyint() achieves a similar effect
   // same "average color" as previous block ?
   if (DC == lastDC)
-    writeBits(output, buffer, huffmanDC[0x00]); // yes, write a special short symbol
+    writeBits(caller, output, buffer, huffmanDC[0x00]); // yes, write a special short symbol
   else
   {
-    auto bits = codewords[DC - lastDC];         // nope, encode the difference to previous block's average color
-    writeBits(output, buffer, huffmanDC[bits.numBits]);
-    writeBits(output, buffer, bits);
+    auto bits = convertCode(DC - lastDC);       // nope, encode the difference to previous block's average color
+    writeBits(caller, output, buffer, huffmanDC[bits.numBits]);
+    writeBits(caller, output, buffer, bits);
   }
 
   // quantize and zigzag the other 63 coefficients
@@ -259,41 +295,40 @@ int16_t encodeBlock(TooJpeg::WRITE_ONE_BYTE output, BitBuffer& buffer,
   for (auto i = 1; i < 8*8; i++) // start at 1 because block64[0]=DC was already processed
   {
     auto value = block64[ZigZagInv[i]];
-    // round to nearest integer
-    quantized[i] = int(value + (value >= 0 ? +0.5f : -0.5f)); // C++11's nearbyint() achieves a similar effect
+    // round to nearest integer (actually, rounding is performed by casting from float to int16)
+    quantized[i] = int16_t(value + (value >= 0 ? +0.5f : -0.5f)); // C++11's nearbyint() achieves a similar effect
     // remember offset of last non-zero coefficient
     if (quantized[i] != 0)
       posNonZero = i;
   }
 
-  // encode ACs (quantized[1..63])
-  auto offset = 0; // upper 4 bits count the number of consecutive zeros
-  for (auto i = 1; i <= posNonZero; i++) // quantized[0] was already written, skip all trailing zeros
+  // encode ACs (Q[1..63])
+  for (auto i = 1; i <= posNonZero; i++) // Q[0] was already written, start at Q[1] and skip all trailing zeros
   {
     // zeros are encoded in a special way
-    if (quantized[i] == 0)  // found another zero ?
+    auto offset = 0; // upper 4 bits count the number of consecutive zeros
+    while (quantized[i] == 0) // found a few zeros, let's count them
     {
+      i++;
       offset    +=  1 << 4; // add 1 to the upper 4 bits
       // split into blocks of at most 16 consecutive zeros
       if (offset > 15 << 4) // remember, the counter is in the upper 4 bits
       {
         offset = 0;
-        writeBits(output, buffer, huffmanAC[0xF0]); // 0xF0 is a special code for "16 zeros"
+        writeBits(caller, output, buffer, huffmanAC[0xF0]); // 0xF0 is a special code for "16 zeros"
       }
-      continue;
     }
 
-    auto encoded = codewords[quantized[i]];
-    // combine number of zeros with the number of bits of the next non-zero value
-    writeBits(output, buffer, huffmanAC[offset + encoded.numBits]);
-    // and the value itself
-    writeBits(output, buffer, encoded);
-    offset = 0;
+    // merge number of zeros with the number of bits of the next non-zero value
+    auto bits = convertCode(quantized[i]);
+    offset   += bits.numBits;
+    writeBits(caller, output, buffer, huffmanAC[offset]);
+    writeBits(caller, output, buffer, bits);
   }
 
   // send end-of-block code (0x00), only needed if there are trailing zeros
   if (posNonZero < 8*8 - 1) // = 63
-    writeBits(output, buffer, huffmanAC[0x00]);
+    writeBits(caller, output, buffer, huffmanAC[0x00]);
 
   return DC;
 }
@@ -302,14 +337,17 @@ int16_t encodeBlock(TooJpeg::WRITE_ONE_BYTE output, BitBuffer& buffer,
 // I don't like these "magic constants" and compute them on my own :-)
 void generateHuffmanTable(const uint8_t numCodes[16], const uint8_t* values, BitCode result[256])
 {
-  uint16_t huffmanCode = 0;
-  // process all bitsizes 1 thru 16, no JPEG Huffman code is allowed to exceed 16 bits
+  uint16_t huffmanCode = 0; // no JPEG Huffman code exceeds 16 bits
+  // process all bitsizes 1 thru 16
   for (auto numBits = 1; numBits <= 16; numBits++)
   {
     // ... and each code of these bitsizes
     for (auto i = 0; i < numCodes[numBits - 1]; i++) // note: numCodes array starts at zero, but smallest bitsize is 1
-      result[*values++] = BitCode(huffmanCode++, numBits);
-
+    {
+      auto current = *values++;
+      result[current].code    = huffmanCode++;
+      result[current].numBits = numBits;
+    }
     // next Huffman code needs to be one bit wider
     huffmanCode <<= 1;
   }
@@ -329,15 +367,20 @@ namespace TooJpeg
 // quality      - between 1 (worst) and 100 (best)
 // downsample   - if true then YCbCr 4:2:0 format is used (smaller size, minor quality loss) instead of 4:4:4, not relevant for grayscale
 // comment      - optional JPEG comment (0/NULL if no comment)
-bool writeJpeg(TooJpeg::WRITE_ONE_BYTE output, const void* pixels_, unsigned short width, unsigned short height,
+bool writeJpeg(void* caller, TooJpeg::WRITE_ONE_BYTE output, const void* pixels_, unsigned short width, unsigned short height,
                bool isRGB, unsigned char quality_, bool downsample, const char* comment)
 {
   // reject invalid pointers
-  if (output == nullptr || pixels_ == nullptr)
+  if (!output || !pixels_)
     return false;
   // check image format
   if (width == 0 || height == 0)
     return false;
+
+  // quality level
+  auto quality = clamp<uint16_t>(quality_, 1, 100);
+  // formula taken from libjpeg
+  quality = quality < 50 ? 5000 / quality : 200 - quality * 2;
 
   // number of components
   auto numComponents = isRGB ? 3 : 1;
@@ -361,11 +404,11 @@ bool writeJpeg(TooJpeg::WRITE_ONE_BYTE output, const void* pixels_, unsigned sho
         0,1,0,1,           // density: 1 pixel "per pixel" horizontally and vertically
         0,0 };             // no thumbnail (size 0 x 0)
   for (auto c : HeaderJfif)
-    output(c);
+    output(caller, c);
 
   // ////////////////////////////////////////
   // comment (optional)
-  if (comment != nullptr)
+  if (comment != 0)
   {
     // look for zero terminator
     auto length = 0; // = strlen(comment);
@@ -373,20 +416,14 @@ bool writeJpeg(TooJpeg::WRITE_ONE_BYTE output, const void* pixels_, unsigned sho
       length++;
 
     // write COM marker
-    writeMarker(output, 0xFE, length + 2);     // length: number of bytes (without zero terminator) + 2 bytes for this length field
+    writeMarker(caller, output, 0xFE, length + 2);     // length: number of bytes (without zero terminator) + 2 bytes for this length field
     // ... and write the comment itself
     for (auto i = 0; i < length; i++)
-      output(comment[i]);
+      output(caller, comment[i]);
   }
 
   // ////////////////////////////////////////
   // adjust quantization tables to desired quality
-
-  // quality level must be in 1 ... 100
-  auto quality = clamp<uint16_t>(quality_, 1, 100);
-  // convert to an internal JPEG quality factor, formula taken from libjpeg
-  quality = quality < 50 ? 5000 / quality : 200 - quality * 2;
-
   uint8_t quantLuminance  [8*8];
   uint8_t quantChrominance[8*8];
   for (auto i = 0; i < 8*8; i++)
@@ -400,44 +437,44 @@ bool writeJpeg(TooJpeg::WRITE_ONE_BYTE output, const void* pixels_, unsigned sho
   }
 
   // write quantization tables
-  writeMarker(output, 0xDB, 2 + (isRGB ? 2 : 1) * (1 + 8*8)); // length: 65 bytes per table + 2 bytes for this length field
+  writeMarker(caller, output, 0xDB, 2 + (isRGB ? 2 : 1) * (1 + 8*8)); // length: 65 bytes per table + 2 bytes for this length field
                                                               // each table has 64 entries and is preceded by an ID byte
 
-  output(0); // first  quantization table
+  output(caller, 0); // first  quantization table
   for (auto c : quantLuminance)
-    output(c);
+    output(caller, c);
   if (isRGB) // chrominance is only relevant for color images
   {
-    output(1); // second quantization table
+    output(caller, 1); // second quantization table
     for (auto c : quantChrominance)
-      output(c);
+      output(caller, c);
   }
 
   // ////////////////////////////////////////
   // write image infos (SOF0 - start of frame)
-  writeMarker(output, 0xC0, 2+6+3*numComponents); // length: 6 bytes general info + 3 per channel + 2 bytes for this length field
+  writeMarker(caller, output, 0xC0, 2+6+3*numComponents); // length: 6 bytes general info + 3 per channel + 2 bytes for this length field
 
   // 8 bits per channel
-  output(8);
+  output(caller, 8);
 
   // image dimensions (big-endian)
-  output(uint8_t(height >> 8)); output(uint8_t(height & 0xFF));
-  output(uint8_t(width  >> 8)); output(uint8_t(width  & 0xFF));
+  output(caller, uint8_t(height >> 8)); output(caller, uint8_t(height & 0xFF));
+  output(caller, uint8_t(width  >> 8)); output(caller, uint8_t(width  & 0xFF));
 
   // sampling and quantization tables for each component
-  output(numComponents);           // 1 component (grayscale, Y only) or 3 components (Y,Cb,Cr)
+  output(caller, numComponents);           // 1 component (grayscale, Y only) or 3 components (Y,Cb,Cr)
   for (auto id = 1; id <= numComponents; id++)
   {
-    output(id);                    // component ID (Y=1, Cb=2, Cr=3)
+    output(caller, id);                    // component ID (Y=1, Cb=2, Cr=3)
     // bitmasks for sampling: highest 4 bits: horizontal, lowest 4 bits: vertical
-    output(id == 1 && downsample ? 0x22 : 0x11); // 0x11 is default YCbCr 4:4:4 and 0x22 stands for YCbCr 4:2:0
-    output(id == 1 ? 0 : 1);       // use quantization table 0 for Y, else table 1
+    output(caller, id == 1 && downsample ? 0x22 : 0x11); // 0x11 is default YCbCr 4:4:4 and 0x22 stands for YCbCr 4:2:0
+    output(caller, id == 1 ? 0 : 1);       // use quantization table 0 for Y, else table 1
   }
 
   // ////////////////////////////////////////
   // Huffman tables
   // DHT marker - define Huffman tables
-  writeMarker(output, 0xC4, isRGB ? (2+208+208) : (2+208));
+  writeMarker(caller, output, 0xC4, isRGB ? (2+208+208) : (2+208));
                                   // 2 bytes for the length field, store chrominance only if needed
                                   //   1+16+12  for the DC luminance
                                   //   1+16+162 for the AC luminance   (208 = 1+16+12 + 1+16+162)
@@ -445,16 +482,16 @@ bool writeJpeg(TooJpeg::WRITE_ONE_BYTE output, const void* pixels_, unsigned sho
                                   //   1+16+162 for the AC chrominance (208 = 1+16+12 + 1+16+162, same as above)
 
   // store luminance's DC+AC Huffman table definitions
-  output(0x00); // highest 4 bits: 0 => DC, lowest 4 bits: 0 => Y (baseline)
+  output(caller, 0x00); // highest 4 bits: 0 => DC, lowest 4 bits: 0 => Y (baseline)
   for (auto c : DcLuminanceCodesPerBitsize)
-    output(c);
+    output(caller, c);
   for (auto c : DcLuminanceValues)
-    output(c);
-  output(0x10); // highest 4 bits: 1 => AC, lowest 4 bits: 0 => Y (baseline)
+    output(caller, c);
+  output(caller, 0x10); // highest 4 bits: 1 => AC, lowest 4 bits: 0 => Y (baseline)
   for (auto c : AcLuminanceCodesPerBitsize)
-    output(c);
+    output(caller, c);
   for (auto c : AcLuminanceValues)
-    output(c);
+    output(caller, c);
 
   // compute actual Huffman code tables (see Jon's code for precalculated tables)
   BitCode huffmanLuminanceDC[256];
@@ -468,16 +505,16 @@ bool writeJpeg(TooJpeg::WRITE_ONE_BYTE output, const void* pixels_, unsigned sho
   if (isRGB)
   {
     // store luminance's DC+AC Huffman table definitions
-    output(0x01); // highest 4 bits: 0 => DC, lowest 4 bits: 1 => Cr,Cb (baseline)
+    output(caller, 0x01); // highest 4 bits: 0 => DC, lowest 4 bits: 1 => Cr,Cb (baseline)
     for (auto c : DcChrominanceCodesPerBitsize)
-      output(c);
+      output(caller, c);
     for (auto c : DcChrominanceValues)
-      output(c);
-    output(0x11); // highest 4 bits: 1 => AC, lowest 4 bits: 1 => Cr,Cb (baseline)
+      output(caller, c);
+    output(caller, 0x11); // highest 4 bits: 1 => AC, lowest 4 bits: 1 => Cr,Cb (baseline)
     for (auto c : AcChrominanceCodesPerBitsize)
-      output(c);
+      output(caller, c);
     for (auto c : AcChrominanceValues)
-      output(c);
+      output(caller, c);
 
     // compute actual Huffman code tables (see Jon's code for precalculated tables)
     generateHuffmanTable(DcChrominanceCodesPerBitsize, DcChrominanceValues, huffmanChrominanceDC);
@@ -486,22 +523,22 @@ bool writeJpeg(TooJpeg::WRITE_ONE_BYTE output, const void* pixels_, unsigned sho
 
   // ////////////////////////////////////////
   // start of scan (there is only a single scan for baseline JPEGs)
-  writeMarker(output, 0xDA, 2+1+2*numComponents+3);
+  writeMarker(caller, output, 0xDA, 2+1+2*numComponents+3);
 
   // assign Huffman tables to each component
-  output(numComponents);
+  output(caller, numComponents);
   for (auto id = 1; id <= numComponents; id++)
   {
     // component ID (Y=1, Cb=2, Cr=3)
-    output(id);
+    output(caller, id);
     // highest 4 bits: DC Huffman table, lowest 4 bits: AC Huffman table
-    output(id == 1 ? 0x00 : 0x11); // Y: tables 0 for DC and AC; Cb + Cr: tables 1 for DC and AC
+    output(caller, id == 1 ? 0x00 : 0x11); // Y: tables 0 for DC and AC; Cb + Cr: tables 1 for DC and AC
   }
 
   // constant values for our baseline JPEGs with a single sequential scan
-  output( 0); // spectral selection: must start at  0
-  output(63); // spectral selection: must stop  at 63
-  output( 0); // successive approximation: must be  0
+  output(caller,  0); // spectral selection: must start at  0
+  output(caller, 63); // spectral selection: must stop  at 63
+  output(caller,  0); // successive approximation: must be  0
 
   // adjust quantization tables with AAN scaling factors to simplify DCT
   float scaledLuminance  [8*8];
@@ -510,34 +547,13 @@ bool writeJpeg(TooJpeg::WRITE_ONE_BYTE output, const void* pixels_, unsigned sho
   {
     auto row    = ZigZagInv[i] / 8; // same as i >> 3
     auto column = ZigZagInv[i] % 8; // same as i &  7
-
-    // scaling constants for AAN DCT algorithm: AanScaleFactors[0] = 1, AanScaleFactors[k=1..7] = cos(k*PI/16) * sqrt(2)
-    static const float AanScaleFactors[8] = { 1, 1.387039845f, SqrtHalfSqrt, 1.175875602f, 1, 0.785694958f, InvSqrtSqrt, 0.275899379f };
     auto factor = 1 / (AanScaleFactors[row] * AanScaleFactors[column] * 8);
     scaledLuminance  [ZigZagInv[i]] = factor / quantLuminance  [i];
     scaledChrominance[ZigZagInv[i]] = factor / quantChrominance[i];
-    // if you really want JPEGs that are bitwise identical to Jon Olick's code then you need slightly different formulas (note: sqrt(8) = 2.828427125f)
-    //static const float aasf[] = { 1.0f * 2.828427125f, 1.387039845f * 2.828427125f, 1.306562965f * 2.828427125f, 1.175875602f * 2.828427125f, 1.0f * 2.828427125f, 0.785694958f * 2.828427125f, 0.541196100f * 2.828427125f, 0.275899379f * 2.828427125f }; // line 240 of jo_jpeg.cpp
+    // if you really want JPEGs that are bitwise identical to Jon's code then you need slightly different formulas (note: sqrt(8) = 2.828427125f)
+    //const float aasf[] = { 1.0f * 2.828427125f, 1.387039845f * 2.828427125f, 1.306562965f * 2.828427125f, 1.175875602f * 2.828427125f, 1.0f * 2.828427125f, 0.785694958f * 2.828427125f, 0.541196100f * 2.828427125f, 0.275899379f * 2.828427125f }; // line 240 of jo_jpeg.cpp
     //scaledLuminance  [ZigZagInv[i]] = 1 / (quantLuminance  [i] * aasf[row] * aasf[column]); // lines 266-267 of jo_jpeg.cpp
     //scaledChrominance[ZigZagInv[i]] = 1 / (quantChrominance[i] * aasf[row] * aasf[column]);
-  }
-
-  // precompute JPEG codewords for quantized DCT
-  BitCode  codewordsArray[2 * CodeWordLimit];          // note: quantized[i] is found at codewordsArray[quantized[i] + CodeWordLimit]
-  BitCode* codewords = &codewordsArray[CodeWordLimit]; // allow negative indices, so quantized[i] is at codewords[quantized[i]]
-  auto numBits = 1; // each codeword has at least one bit (value == 0 is undefined)
-  auto mask    = 1; // mask is always 2^numBits - 1, initial value 2^1-1 = 2-1 = 1
-  for (int16_t value = 1; value < CodeWordLimit; value++)
-  {
-    // numBits = position of highest set bit (ignoring the sign)
-    // mask    = (2^numBits) - 1
-    if (value > mask) // one more bit ?
-    {
-      numBits++;
-      mask = (mask << 1) | 1; // append a set bit
-    }
-    codewords[- value] = BitCode(mask - value, numBits); // note that I use a negative index => codewords[-value] = codewordsArray[CodeWordLimit  value]
-    codewords[+ value] = BitCode(       value, numBits);
   }
 
   // all encoded bits pass through this buffer, it writes to output whenever a byte is completed
@@ -545,120 +561,111 @@ bool writeJpeg(TooJpeg::WRITE_ONE_BYTE output, const void* pixels_, unsigned sho
 
   // just convert image data from void*
   auto pixels = (const uint8_t*)pixels_;
-  // the next two variables are frequently used when checking for image borders
-  auto maxWidth  = width  - 1; // "last row"
-  auto maxHeight = height - 1; // "bottom line"
+
+  // break down the image into 8x8 blocks and convert from RGB or grayscale to YCbCr color space
+  float Y[8][8], Cb[8][8], Cr[8][8];
   // average color of the previous 8x8 block
   int16_t lastYDC = 0, lastCbDC = 0, lastCrDC = 0;
 
-  // process MCUs (minimum codes units) => image is subdivided into a grid of 8x8 or 16x16 tiles
-  auto sampling = downsample ? 2 : 1; // 1x1 or 2x2 sampling
-  auto mcuSize  = 8 * sampling;
-  for (auto mcuY = 0; mcuY < height; mcuY += mcuSize) // each step is either 8 or 16 (=mcuSize)
-    for (auto mcuX = 0; mcuX < width; mcuX += mcuSize)
+  // downsampling of Cb and Cr channels, if sampling = 2 then 2x2 samples are used
+  auto sampling   = downsample ? 2 : 1;
+  auto numSamples = sampling * sampling; // 1 (grayscale, YCbCr444) or 4 (YCbCr420)
+  // only for downsampled: sum of four pixels' red, green, blue components
+  float red[8][8] = { { 0 } }, green[8][8] = { { 0 } }, blue[8][8] = { { 0 } }; // uint16_t works, too, but float is faster
+
+  // process MCUs (minimum codes units)
+  for (auto mcuY = 0; mcuY < height; mcuY += 8 * sampling)
+    for (auto mcuX = 0; mcuX < width; mcuX += 8 * sampling)
     {
       // YCbCr 4:4:4 format: each MCU is a 8x8 block - the same applies to grayscale images, too
       // YCbCr 4:2:0 format: each MCU represents a 16x16 block, stored as 4x 8x8 Y-blocks plus 1x 8x8 Cb and 1x 8x8 Cr blocks)
-      float Y[8][8], Cb[8][8], Cr[8][8];
-      for (auto blockY = 0; blockY < mcuSize; blockY += 8) // iterate once (YCbCr444 and grayscale) or twice (YCbCr420)
-        for (auto blockX = 0; blockX < mcuSize; blockX += 8)
-        {
-          // now we finally have an 8x8 block ...
-          for (auto deltaY = 0; deltaY < 8; deltaY++)
+      for (auto block = 0; block < numSamples; block++) // this loop is iterated once (grayscale, 4:4:4) or four times (4:2:0)
+      {
+        // subdivide into 8x8 blocks where blockX and blockY indicate the minimum x and y of the current block
+        auto blockX = 8 * (block & 1); // same as 8 * (block % 2) => { 0, 8, 0, 8 }
+        auto blockY = 4 * (block & 2); // same as 8 * (block / 2) => { 0, 0, 8, 8 }
+
+        // now we finally have an 8x8 block ...
+        for (auto deltaY = 0; deltaY < 8; deltaY++)
+          for (auto deltaX = 0; deltaX < 8; deltaX++)
           {
-            auto column = minimum(mcuX + blockX         , maxWidth); // must not exceed image borders, replicate last row/column if needed
-            auto row    = minimum(mcuY + blockY + deltaY, maxHeight);
-            for (auto deltaX = 0; deltaX < 8; deltaX++)
+            // find actual pixel position within the current image
+            auto column   = minimum(mcuX + blockX + deltaX, width  - 1); // must not exceed image borders, replicate last row/column if needed
+            auto row      = minimum(mcuY + blockY + deltaY, height - 1);
+            auto pixelPos = row * (int32_t)width + column; // the cast ensures that we don't run into multiplication overflows
+
+            // grayscale images have solely a Y channel which can be easily derived from the input pixel by shifting it by 128
+            if (!isRGB)
             {
-              // find actual pixel position within the current image
-              auto pixelPos = row * (int32_t)width + column; // the cast ensures that we don't run into multiplication overflows
-              if (column < width - 1)
-                column++;
+              Y[deltaY][deltaX] = pixels[pixelPos] - 128.f;
+              continue;
+            }
 
-              // grayscale images have solely a Y channel which can be easily derived from the input pixel by shifting it by 128
-              if (!isRGB)
-              {
-                Y[deltaY][deltaX] = pixels[pixelPos] - 128.f;
-                continue;
-              }
+            // RGB: 3 bytes per pixel (whereas grayscale images have only 1 byte per pixel)
+            pixelPos *= numComponents;
+            float r = pixels[pixelPos    ];
+            float g = pixels[pixelPos + 1];
+            float b = pixels[pixelPos + 2];
 
-              // RGB: 3 bytes per pixel (whereas grayscale images have only 1 byte per pixel)
-              auto r = pixels[3 * pixelPos    ];
-              auto g = pixels[3 * pixelPos + 1];
-              auto b = pixels[3 * pixelPos + 2];
+            // compute Y channel
+            Y[deltaY][deltaX] = rgb2y(r, g, b) - 128; // again, the JPEG standard requires Y to be shifted by 128
 
-              Y   [deltaY][deltaX] = rgb2y (r, g, b) - 128.f; // again, the JPEG standard requires Y to be shifted by 128
-              // YCbCr444 is easy, the more complex YCbCr420 has to be computed about 20 lines below in a second pass
-              if (!downsample)
-              {
-                Cb[deltaY][deltaX] = rgb2cb(r, g, b); // standard RGB-to-YCbCr conversion
-                Cr[deltaY][deltaX] = rgb2cr(r, g, b);
-              }
+            if (downsample)
+            {
+              // defer Cb/Cr computation if YCbCr420 mode: we must average 2x2 pixels, so let's "shrink" a 16x16 area to 8x8
+              auto x = (blockX + deltaX) / 2;
+              auto y = (blockY + deltaY) / 2;
+
+              // add red, green, blue (note: each number should be weighted by 1/4, this is done later)
+              red  [y][x] += r;
+              green[y][x] += g;
+              blue [y][x] += b;
+            }
+            else
+            {
+              // YCbCr444: computation of Cb and Cr is similar to Y channel but without the need to subtract 128
+              Cb[deltaY][deltaX] = rgb2cb(r, g, b);
+              Cr[deltaY][deltaX] = rgb2cr(r, g, b);
             }
           }
 
         // encode Y channel
-        lastYDC = encodeBlock(output, buffer, Y, scaledLuminance, lastYDC, huffmanLuminanceDC, huffmanLuminanceAC, codewords);
-        // Cb and Cr are encoded about 50 lines below
+        lastYDC = encodeBlock(caller, output, buffer, Y, scaledLuminance, lastYDC, huffmanLuminanceDC, huffmanLuminanceAC);
       }
 
-      // grayscale images don't need any Cb and Cr information
       if (!isRGB)
         continue;
 
       // ////////////////////////////////////////
-      // the following lines are only relevant for YCbCr420:
-      // average/downsample chrominance of four pixels while respecting the image borders
+      // YCbCr420 / downsampled: convert summed RGB values to Cb and Cr
       if (downsample)
-        for (short deltaY = 7; deltaY >= 0; deltaY--) // iterating loop in reverse increases cache read efficiency
-        {
-          auto row      = minimum(mcuY + 2*deltaY, maxHeight); // each deltaX/Y step covers a 2x2 area
-          auto column   =         mcuX;                         // column is updated inside next loop
-          auto pixelPos = (row * width + column) * 3;           // numComponents = 3
-
-          // deltas (in bytes) to next row / column, must not exceed image borders
-          auto rowStep    = (row    < maxHeight) ? 3 * width : 0; // always numComponents*width except for bottom    line
-          auto columnStep = (column < maxWidth ) ? 3         : 0; // always numComponents       except for rightmost pixels
-
-          for (int16_t deltaX = 0; deltaX < 8; deltaX++)
+        for (auto y = 0; y < 8; y++)
+          for (auto x = 0; x < 8; x++)
           {
-            // let's add all four samples (2x2 area)
-            auto right     = pixelPos + columnStep;
-            auto down      = pixelPos +              rowStep;
-            auto downRight = pixelPos + columnStep + rowStep;
+            // each number in the arrays "red", "green" and "blue" consists of the summed values of four pixels
+            // so I still have to divide them by 4 to get their average value
+            auto r = red  [y][x] / 4.f; // numSamples = 4
+            auto g = green[y][x] / 4.f;
+            auto b = blue [y][x] / 4.f;
 
-            // cast from 8 bits to >8 bits to avoid overflows
-            auto r = uint16_t(pixels[pixelPos    ]) + pixels[right    ] + pixels[down    ] + pixels[downRight    ];
-            auto g = uint16_t(pixels[pixelPos + 1]) + pixels[right + 1] + pixels[down + 1] + pixels[downRight + 1];
-            auto b = uint16_t(pixels[pixelPos + 2]) + pixels[right + 2] + pixels[down + 2] + pixels[downRight + 2];
+            Cb[y][x] = rgb2cb(r, g, b);
+            Cr[y][x] = rgb2cr(r, g, b);
 
-            // convert to Cb and Cr
-            Cb[deltaY][deltaX] = rgb2cb(r, g, b) / 4.f; // I still have to divide r,g,b by 4 to get their average values
-            Cr[deltaY][deltaX] = rgb2cr(r, g, b) / 4.f; // it's a bit faster if done AFTER CbCr conversion
-
-            pixelPos += 2*3; // 2 pixels => 6 bytes (2*numComponents)
-            column   += 2;   // step forward to next 2x2 area
-
-            // reached right border ?
-            if (column >= maxWidth)
-            {
-              columnStep = 0;
-              pixelPos = ((row + 1) * width - 1) * 3; // same as (row * width + column) * numComponents
-            }
+            // reset arrays for next block
+            red[y][x] = green[y][x] = blue[y][x] = 0;
           }
-        } // end of YCbCr420 code for Cb and Cr
 
-      // encode Cb and Cr
-      lastCbDC = encodeBlock(output, buffer, Cb, scaledChrominance, lastCbDC, huffmanChrominanceDC, huffmanChrominanceAC, codewords);
-      lastCrDC = encodeBlock(output, buffer, Cr, scaledChrominance, lastCrDC, huffmanChrominanceDC, huffmanChrominanceAC, codewords);
+      // encode Cb + Cr channels
+      lastCbDC = encodeBlock(caller, output, buffer, Cb, scaledChrominance, lastCbDC, huffmanChrominanceDC, huffmanChrominanceAC);
+      lastCrDC = encodeBlock(caller, output, buffer, Cr, scaledChrominance, lastCrDC, huffmanChrominanceDC, huffmanChrominanceAC);
     }
 
-  // fill unused bits of the last byte with 1s and flush it
-  writeBits(output, buffer, { 0x7F, 7 }); // we need zero to seven set bits to fill the last byte: 0x7F = binary 0111 1111
+  // fill remaining bits with 1s
+  writeBits(caller, output, buffer, { 0x7F, 7 }); // seven set bits: 0x7F = binary 0111 1111
 
   // ///////////////////////////
   // EOI marker
-  output(0xFF); output(0xD9); // no length, therefore I can't use writeMarker()
+  output(caller, 0xFF); output(caller, 0xD9); // no length, therefore I can't use writeMarker()
   return true;
 } // writeJpeg()
 
